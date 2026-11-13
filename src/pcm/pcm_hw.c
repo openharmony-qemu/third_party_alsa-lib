@@ -27,6 +27,12 @@
  *
  */
 
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#include <stdint.h>
+#endif
 #include "pcm_local.h"
 #include "../control/control_local.h"
 #include "../timer/timer_local.h"
@@ -87,9 +93,19 @@ static const snd_pcm_fast_ops_t snd_pcm_hw_fast_ops_timer;
  *
  */
 
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+struct m398_hw;
+static void m398_clock579(struct m398_hw *hw, int type, int mode);
+static void m398_reset579(struct m398_hw *hw);
+#endif
+
 typedef struct {
 	int version;
 	int fd;
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	struct m398_hw *onset398;
+	uint64_t onset398_instance;
+#endif
 	int card, device, subdevice;
 
 	volatile struct snd_pcm_mmap_status * mmap_status;
@@ -414,6 +430,9 @@ static int snd_pcm_hw_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t * params)
 		snd_checknum(PCM, "SNDRV_PCM_IOCTL_HW_PARAMS failed (%i)", err);
 		return err;
 	}
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	m398_reset579(hw->onset398);
+#endif
 	params->info &= ~0xf0000000;
 	if (pcm->tstamp_type != SND_PCM_TSTAMP_TYPE_GETTIMEOFDAY)
 		params->info |= SND_PCM_INFO_MONOTONIC;
@@ -528,6 +547,9 @@ static int snd_pcm_hw_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t * params)
 	snd_pcm_hw_t *hw = pcm->private_data;
 	int fd = hw->fd, err = 0;
 	int old_period_event = sw_get_period_event(params);
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	int applied579 = 0;
+#endif
 	sw_set_period_event(params, 0);
 	if ((snd_pcm_tstamp_t) params->tstamp_mode == pcm->tstamp_mode &&
 	    (snd_pcm_tstamp_type_t) params->tstamp_type == pcm->tstamp_type &&
@@ -558,6 +580,9 @@ static int snd_pcm_hw_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t * params)
 		snd_checknum(PCM, "SNDRV_PCM_IOCTL_SW_PARAMS failed (%i)", err);
 		goto out;
 	}
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	applied579 = 1;
+#endif
 	hw->prepare_reset_sw_params = false;
 	if ((snd_pcm_tstamp_type_t) params->tstamp_type != pcm->tstamp_type) {
 		if (hw->version < SNDRV_PROTOCOL_VERSION(2, 0, 12)) {
@@ -579,6 +604,10 @@ static int snd_pcm_hw_sw_params(snd_pcm_t *pcm, snd_pcm_sw_params_t * params)
 		hw->period_event = old_period_event;
 	}
  out:
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	if (!err && applied579)
+		m398_clock579(hw->onset398, params->tstamp_type, params->tstamp_mode);
+#endif
 	sw_set_period_event(params, old_period_event);
 	return err;
 }
@@ -696,12 +725,18 @@ static int snd_pcm_hw_prepare(snd_pcm_t *pcm)
 			return err;
 		}
 		hw->prepare_reset_sw_params = false;
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+		m398_clock579(hw->onset398, sw_params.tstamp_type, sw_params.tstamp_mode);
+#endif
 	}
 	if (ioctl(fd, SNDRV_PCM_IOCTL_PREPARE) < 0) {
 		err = -errno;
 		snd_checknum(PCM, "SNDRV_PCM_IOCTL_PREPARE failed (%i)", err);
 		return err;
 	}
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	m398_reset579(hw->onset398);
+#endif
 	return query_status_and_control_data(hw);
 }
 
@@ -714,6 +749,9 @@ static int snd_pcm_hw_reset(snd_pcm_t *pcm)
 		snd_checknum(PCM, "SNDRV_PCM_IOCTL_RESET failed (%i)", err);
 		return err;
 	}
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	m398_reset579(hw->onset398);
+#endif
 	return query_status_and_control_data(hw);
 }
 
@@ -747,6 +785,9 @@ static int snd_pcm_hw_drop(snd_pcm_t *pcm)
 		snd_checknum(PCM, "SNDRV_PCM_IOCTL_DROP failed (%i)", err);
 		return err;
 	} else {
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+		m398_reset579(hw->onset398);
+#endif
 	}
 	return 0;
 }
@@ -936,6 +977,58 @@ static int snd_pcm_hw_unlink(snd_pcm_t *pcm)
 	return 0;
 }
 
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+#include "media398_onset.h"
+
+/* These are explicitly NEW398 snapshots of the original already-mapped ALSA
+ * status/control. They are NOT377's extra synchronous HWSYNC queries and cannot
+ * authorize379 anchors. Independent target pidfd/kcmp/SYNC_PTR remains needed. */
+static struct m398_snapshot media398_existing_snapshot(snd_pcm_hw_t *hw)
+{
+    struct m398_snapshot r = {0};
+    if (!hw->mmap_status || !hw->mmap_control)
+        return r;
+    int first_state = hw->mmap_status->state;
+    snd_pcm_uframes_t first_appl = hw->mmap_control->appl_ptr;
+    r.hw = (uint64_t)hw->mmap_status->hw_ptr;
+    r.appl = (uint64_t)first_appl;
+    r.state = first_state;
+    atomic_signal_fence(memory_order_seq_cst);
+    r.coherent = first_state == hw->mmap_status->state && first_appl == hw->mmap_control->appl_ptr;
+    return r;
+}
+static void media398_before(snd_pcm_t *pcm, struct m398_loan *loan)
+{
+    int saved = errno;
+    loan->active = 0;
+    snd_pcm_hw_t *hw = pcm->private_data;
+    if (hw->onset398 && pcm->stream == SND_PCM_STREAM_PLAYBACK &&
+        pcm->format == SND_PCM_FORMAT_S16_LE && pcm->channels == 2 &&
+        pcm->rate == 48000 && pcm->frame_bits == 32 && pcm->access == SND_PCM_ACCESS_RW_INTERLEAVED &&
+        m398_try_loan(hw->onset398, hw->onset398_instance, loan)) {
+        loan->record->before_ns = m398_clock();
+        loan->record->before = media398_existing_snapshot(hw);
+        loan->record->after_ns = m398_clock();
+    }
+    errno = saved;
+}
+static void media398_after(snd_pcm_t *pcm, struct m398_loan *loan, const void *buffer,
+    snd_pcm_uframes_t requested, snd_pcm_sframes_t accepted, int original_error)
+{
+    int saved = errno;
+    if (loan->active) {
+        snd_pcm_hw_t *hw = pcm->private_data;
+        struct m398_snapshot after = media398_existing_snapshot(hw);
+        uint64_t returned_ns = m398_clock();
+        if (pcm->format != SND_PCM_FORMAT_S16_LE || pcm->channels != 2 || pcm->rate != 48000 ||
+            pcm->frame_bits != 32 || pcm->access != SND_PCM_ACCESS_RW_INTERLEAVED)
+            after.coherent = 0;
+        m398_publish(loan, after, buffer, (uint64_t)requested, (int64_t)accepted, original_error, returned_ns);
+    }
+    errno = saved;
+}
+#endif
+
 static snd_pcm_sframes_t snd_pcm_hw_writei(snd_pcm_t *pcm, const void *buffer, snd_pcm_uframes_t size)
 {
 	int err;
@@ -945,10 +1038,17 @@ static snd_pcm_sframes_t snd_pcm_hw_writei(snd_pcm_t *pcm, const void *buffer, s
 	xferi.buf = (char*) buffer;
 	xferi.frames = size;
 	xferi.result = 0; /* make valgrind happy */
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	struct m398_loan onset398;
+	media398_before(pcm, &onset398);
+#endif
 	if (ioctl(fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xferi) < 0)
 		err = -errno;
 	else
 		err = query_status_and_control_data(hw);
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	media398_after(pcm, &onset398, buffer, size, xferi.result, err);
+#endif
 #ifdef DEBUG_RW
 	fprintf(stderr, "hw_writei: frames = %li, xferi.result = %li, err = %i\n", size, xferi.result, err);
 #endif
@@ -1172,6 +1272,9 @@ static int snd_pcm_hw_close(snd_pcm_t *pcm)
 {
 	snd_pcm_hw_t *hw = pcm->private_data;
 	int err = 0;
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	m398_retire_hw(hw->onset398); /* memory-only; never waits or closes product FD */
+#endif
 	if (close(hw->fd)) {
 		err = -errno;
 		snd_checknum(PCM, "close failed (%i)", err);
@@ -1734,6 +1837,13 @@ int snd_pcm_hw_open_fd(snd_pcm_t **pcmp, const char *name, int fd,
 		return ret;
 	}
 
+#ifdef MEDIA398_ONSET_DIAGNOSTIC
+	if (pcm->stream == SND_PCM_STREAM_PLAYBACK) {
+		hw->onset398 = m398_register_hw(hw->fd, hw->card, hw->device, hw->subdevice);
+		if (hw->onset398)
+			hw->onset398_instance = atomic_load(&hw->onset398->instance);
+	}
+#endif
 	*pcmp = pcm;
 	return 0;
 }

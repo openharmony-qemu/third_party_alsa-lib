@@ -15,6 +15,8 @@ import("//build/ohos.gni")
 
 declare_args() {
   alsa_lib_feature_config_enable = false
+  # Process-local PCM diagnostic for QEMU observation; off on other builds.
+  alsa_lib_pcm_onset_diagnostic_enable = false
 }
 
 config("alsa_lib_header") {
@@ -74,6 +76,9 @@ config("alsa_lib_config") {
 }
 
 ohos_shared_library("libasound") {
+  if (alsa_lib_pcm_onset_diagnostic_enable) {
+    defines = [ "MEDIA398_ONSET_DIAGNOSTIC=1" ]
+  }
   sources = [
     "//third_party/alsa-lib/src/async.c",
     "//third_party/alsa-lib/src/conf.c",
